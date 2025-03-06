@@ -34,7 +34,7 @@ const openai = new OpenAI();
 // 1) Modifications : TTS ElevenLabs
 // -----------------------------
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || "";
-const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "TxGEqnHWrfWFTfG45HnX"; // Ex: "Rachel"
+const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "WQKwBV2Uzw1gSGr69N8I"; // Ex: "Rachel"
 
 // Ce script system et messages initiaux sont identiques
 const systemMessage = `Tu es Pam, un agent téléphonique IA conçu pour démontrer les capacités de notre solution SaaS, qui permet de créer et de personnaliser des agents téléphoniques intelligents.
