@@ -431,12 +431,11 @@ async function synthesizeElevenLabs(text) {
   if (!ELEVENLABS_API_KEY) {
     throw new Error("ELEVENLABS_API_KEY is missing");
   }
-  // Voir doc: https://api.elevenlabs.io/v1/text-to-speech
-  const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`;
+  // Voir doc: https://api.elevenlabs.io/v2.5/text-to-speech
+  const url = `https://api.elevenlabs.io/v2.5/text-to-speech/${ELEVENLABS_VOICE_ID}`;
   const body = {
     text,
     voice_settings: {
-      speed:1.02,
       stability: 0.75,
       similarity_boost: 0.82,
     },
