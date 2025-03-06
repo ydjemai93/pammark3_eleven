@@ -436,7 +436,7 @@ async function synthesizeElevenLabs(text) {
   const body = {
     text,
     voice_settings: {
-      model_id: "eleven_multilingual_v2",
+      model_id: "eleven_multilingual_v1",
       stability: 0.75,
       similarity_boost: 0.82,
     },
