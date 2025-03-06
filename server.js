@@ -436,8 +436,9 @@ async function synthesizeElevenLabs(text) {
   const body = {
     text,
     voice_settings: {
-      stability: 0.2,
-      similarity_boost: 0.7,
+      speed:1.02,
+      stability: 75,
+      similarity_boost: 82,
     },
   };
   const resp = await axios.post(url, body, {
