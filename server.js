@@ -29,30 +29,27 @@ const OpenAI = require("openai");
 const openai = new OpenAI();
 
 // -----------------------------
-// 1) Modifications : TTS ElevenLabs
+// TTS ElevenLabs paramètres
 // -----------------------------
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || "";
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "WQKwBV2Uzw1gSGr69N8I"; // Exemple par défaut
 
-// Ajuste la stabilité/similarité pour un rendu plus naturel
+// Paramètres ajustés pour une voix plus naturelle
 const ELEVENLABS_STABILITY = 0.4;
 const ELEVENLABS_SIMILARITY = 0.9;
 
-// Script system (peut être adapté à ton contexte)
+// Script système et message initial
 const systemMessage = `Tu es Pam, un agent téléphonique IA conçu pour démontrer les capacités de notre solution SaaS...`;
-
-// Message initial
 const initialAssistantMessage = `Bonjour ! Je suis Pam, ton agent téléphonique IA. Merci d’avoir rempli le formulaire ! Comment puis-je t’aider aujourd’hui ?`;
 
-// Ports et variables globales
 const PORT = process.env.PORT || 8080;
 let streamSid = "";
 let keepAlive;
 let conversation = [];
 
-// Flags
+// Flags pour gérer le TTS et interruption
 let speaking = false;
-let ttsAbort = false; // permet de couper un TTS en cours
+let ttsAbort = false; // Permet de stopper un TTS en cours
 
 //------------------------------------------
 // Serveur HTTP
@@ -76,8 +73,10 @@ const server = http.createServer(async (req, res) => {
       const filePath = path.join(__dirname, "templates", "streams.xml");
       let streamsXML = fs.readFileSync(filePath, "utf8");
       let serverUrl = process.env.SERVER || "localhost";
+      // Enlever le préfixe http:// ou https://
       serverUrl = serverUrl.replace(/^https?:\/\//, "");
       streamsXML = streamsXML.replace("<YOUR NGROK URL>", serverUrl);
+      console.log("streams.xml généré :", streamsXML); // Pour vérification
 
       res.writeHead(200, { "Content-Type": "text/xml" });
       return res.end(streamsXML);
@@ -134,7 +133,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // 404
+  // 404 pour les autres routes
   res.writeHead(404, { "Content-Type": "text/plain" });
   res.end("Not Found");
 });
@@ -147,8 +146,9 @@ const wsServer = new WebSocketServer({
   autoAcceptConnections: false,
 });
 
+// <-- MODIF : Accepter toute URL commençant par "/streams" pour être plus tolérant
 wsServer.on("request", (request) => {
-  if (request.resourceURL.pathname === "/streams") {
+  if (request.resourceURL.pathname.startsWith("/streams")) {
     console.log("/streams => accepted");
     const connection = request.accept(null, request.origin);
     new MediaStream(connection);
@@ -166,16 +166,14 @@ class MediaStream {
     this.connection = connection;
     this.hasSeenMedia = false;
 
-    // Reset conversation
+    // Reset de la conversation et ajout du message initial
     conversation = [];
-
-    // Ajouter message assistant initial
     conversation.push({
       role: "assistant",
       content: initialAssistantMessage,
     });
 
-    // Instancier STT Deepgram
+    // Instancier Deepgram pour le STT
     this.deepgram = setupDeepgram(this);
 
     this.connection.on("message", this.processMessage.bind(this));
@@ -191,7 +189,7 @@ class MediaStream {
           break;
         case "start":
           console.log("twilio: start =>", data);
-          // Lire direct le message initial
+          // Démarrer immédiatement la lecture du message initial
           this.speak(initialAssistantMessage).catch((err) => console.error(err));
           break;
         case "media":
@@ -219,18 +217,16 @@ class MediaStream {
 
   async speak(text) {
     speaking = true;
-    ttsAbort = false; // reset abort
+    ttsAbort = false; // réinitialise l'arrêt du TTS
 
     try {
       const audioBuffer = await synthesizeElevenLabs(text);
-
       if (ttsAbort) {
         console.log("speak => TTS abort triggered, skip sending audio");
         return;
       }
       const mulawBuffer = await convertToMulaw8k(audioBuffer);
       if (ttsAbort) return;
-
       this.sendAudioInChunks(mulawBuffer);
     } catch (err) {
       console.error("Error in speak =>", err);
@@ -245,7 +241,6 @@ class MediaStream {
       const end = Math.min(offset + chunkSize, mulawBuf.length);
       const slice = mulawBuf.slice(offset, end);
       offset = end;
-
       const payloadBase64 = slice.toString("base64");
       const msg = {
         event: "media",
@@ -262,7 +257,7 @@ class MediaStream {
 }
 
 //------------------------------------------
-// Setup Deepgram (moins sensible + moins de latence final)
+// Setup Deepgram STT
 //------------------------------------------
 function setupDeepgram(mediaStream) {
   let is_finals = [];
@@ -274,12 +269,8 @@ function setupDeepgram(mediaStream) {
     sample_rate: 8000,
     channels: 1,
     no_delay: true,
-
-    // NEW: baisser un peu pour avoir un "final" plus vite
-    endpointing: 200,
-    utterance_end_ms: 400,
-
-    // interim_results: on ne coupera pas TTS si c’est un tout petit interim
+    endpointing: 200,         // <-- MODIF : réduction pour détecter plus vite la fin
+    utterance_end_ms: 400,    // <-- MODIF : fin d'utterance plus rapide
     interim_results: true,
   });
 
@@ -293,15 +284,12 @@ function setupDeepgram(mediaStream) {
       const transcript = data.channel.alternatives[0].transcript;
       if (!transcript) return;
 
-      // Nombre de mots et caractères
       const wordCount = transcript.trim().split(/\s+/).length;
       const charCount = transcript.trim().length;
 
       if (!data.is_final) {
         console.log("deepgram STT => interim =>", transcript);
-
-        // On coupe TTS seulement si l'interim est un peu "long"
-        // (ex: 3 mots ou 15+ caractères)
+        // Interruption seulement si l'interim est suffisamment long
         if ((wordCount >= 3 || charCount > 15) && speaking) {
           console.log("interrupt TTS => user is speaking (long enough interim)");
           speaking = false;
@@ -310,33 +298,26 @@ function setupDeepgram(mediaStream) {
         return;
       }
 
-      // data.is_final = true
       if (data.speech_final) {
-        // speech_final => phrase terminée
         is_finals.push(transcript);
         const utterance = is_finals.join(" ");
         is_finals = [];
-
         console.log("deepgram STT => speech_final =>", utterance);
         speaking = false;
         ttsAbort = true;
-
         conversation.push({ role: "user", content: utterance });
         callGPT(mediaStream);
       } else {
-        // final non speech_final => ex: sous-phrase
         is_finals.push(transcript);
         console.log("deepgram STT => final =>", transcript);
       }
     });
 
     dgLive.addListener(LiveTranscriptionEvents.UtteranceEnd, () => {
-      // On peut récupérer ici si besoin, mais speech_final gère déjà
       if (is_finals.length) {
         const utterance = is_finals.join(" ");
         is_finals = [];
         console.log("deepgram STT => utteranceEnd =>", utterance);
-
         speaking = false;
         ttsAbort = true;
         conversation.push({ role: "user", content: utterance });
@@ -358,7 +339,7 @@ function setupDeepgram(mediaStream) {
 }
 
 //------------------------------------------
-// callGPT => streaming GPT
+// callGPT : streaming GPT completions
 //------------------------------------------
 async function callGPT(mediaStream) {
   console.log("callGPT => conversation so far:", conversation);
@@ -383,24 +364,18 @@ async function callGPT(mediaStream) {
     if (chunkMessage) {
       assistantReply += chunkMessage;
       partialBuffer += chunkMessage;
-
-      // On déclenche plus vite le TTS => ~ 60 caractères ou ponctuation
-      // pour éviter d'attendre trop longtemps la 1re phrase
+      // Déclenche le TTS dès que le bloc atteint ~60 caractères et se termine par une ponctuation
       if (/[.!?]/.test(partialBuffer) && partialBuffer.length > 60) {
         const toSpeak = partialBuffer.trim();
         partialBuffer = "";
         await mediaStream.speak(toSpeak);
-
         if (ttsAbort) break;
       }
     }
   }
-
-  // S'il reste un bout de phrase final
   if (partialBuffer.trim() && !ttsAbort) {
     await mediaStream.speak(partialBuffer.trim());
   }
-
   if (assistantReply.trim()) {
     conversation.push({ role: "assistant", content: assistantReply });
   }
@@ -431,7 +406,7 @@ async function synthesizeElevenLabs(text) {
     },
     responseType: "arraybuffer",
   });
-  return Buffer.from(resp.data); // MP3
+  return Buffer.from(resp.data);
 }
 
 function convertToMulaw8k(mp3Buffer) {
