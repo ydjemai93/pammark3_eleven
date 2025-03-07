@@ -1,5 +1,3 @@
-// server.js
-
 require("dotenv").config();
 const http = require("http");
 const fs = require("fs");
@@ -8,7 +6,7 @@ const url = require("url");
 const { server: WebSocketServer } = require("websocket");
 const WebSocket = require("ws");
 const axios = require("axios");
-const { spawn } = require("child_process"); // pour lancer ffmpeg si besoin
+const { spawn } = require("child_process");
 
 // Twilio
 const accountSid = process.env.TWILIO_ACCOUNT_SID;
@@ -22,7 +20,7 @@ if (accountSid && authToken) {
   console.warn("Twilio credentials missing => no outbound calls");
 }
 
-// Deepgram (Uniquement pour STT)
+// Deepgram
 const { createClient, LiveTranscriptionEvents } = require("@deepgram/sdk");
 const deepgramClient = createClient(process.env.DEEPGRAM_API_KEY);
 
@@ -34,39 +32,28 @@ const openai = new OpenAI();
 // 1) Modifications : TTS ElevenLabs
 // -----------------------------
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || "";
-const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "WQKwBV2Uzw1gSGr69N8I"; // Ex: "Rachel"
+const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "WQKwBV2Uzw1gSGr69N8I"; // Remplace par le tien
 
-// Ce script system et messages initiaux sont identiques
-const systemMessage = `Tu es Pam, un agent téléphonique IA conçu pour démontrer les capacités de notre solution SaaS, qui permet de créer et de personnaliser des agents téléphoniques intelligents.
+// <-- MODIF: Ajuste la stability et similarity_boost pour plus de naturel
+//    Baisse stability et augmente un peu similarity_boost
+//    Ajuste ces valeurs si la voix devient trop instable/robotique
+const ELEVENLABS_STABILITY = 0.4;
+const ELEVENLABS_SIMILARITY = 0.9;
 
-En tant que démo interactive, ton rôle est de montrer aux utilisateurs comment un agent IA peut gérer efficacement des tâches de secrétariat, de support client, de vente et d'assistance technique. Grâce à une intégration fluide avec divers outils professionnels, tu peux t’adapter aux besoins spécifiques de chaque entreprise.
+// Script system
+const systemMessage = `Tu es Pam, un agent téléphonique IA conçu pour démontrer les capacités de notre solution SaaS...`;
 
-Ton objectif est d’adopter une voix naturelle et humaine tout en suivant ces étapes :
+// Message initial
+const initialAssistantMessage = `Bonjour ! Je suis Pam, ton agent téléphonique IA. Merci d’avoir rempli le formulaire...`;
 
-1. Saluer poliment l’utilisateur et reconnaître la soumission du formulaire.
-2. Présenter tes capacités et expliquer en quoi un agent IA peut être utile.
-3. Fournir des exemples concrets ou des scénarios d’utilisation pour illustrer ton efficacité.
-4. Résumer et inviter l’utilisateur à poser des questions ou à faire une demande spécifique.
-
-La conversation doit être fluide, professionnelle et engageante. Adapte-toi aux réponses de l’utilisateur et évite de réciter ces instructions de manière mécanique.
-`;
-
-const initialAssistantMessage = `Bonjour ! Je suis Pam, ton agent téléphonique IA. Merci d’avoir rempli le formulaire sur notre site web.  
-Je suis là pour te faire une courte démonstration de ce que je sais faire : gestion de secrétariat, support client, assistance à la vente et aide technique.  
-Comment puis-je t’aider aujourd’hui ?`;
-
-// Variables identiques
 const PORT = process.env.PORT || 8080;
 let streamSid = "";
 let keepAlive;
 let conversation = [];
 
+// Global flags
 let speaking = false;
-let firstByte = true;
-let llmStart = 0;
-let ttsStart = 0;
-let send_first_sentence_input_time = null;
-const chars_to_check = [".", ",", "!", "?", ";", ":"];
+let ttsAbort = false; // <-- MODIF: Pour stopper le TTS en cours si besoin
 
 //------------------------------------------
 // Serveur HTTP
@@ -179,23 +166,16 @@ class MediaStream {
   constructor(connection) {
     this.connection = connection;
     this.hasSeenMedia = false;
-
-    // Reset conversation
-    conversation = [];
-
-    // Ajouter un message assistant initial
+    conversation = []; // reset conversation
+    // On push le message initial assistant
     conversation.push({
       role: "assistant",
       content: initialAssistantMessage,
     });
 
-    // Instancier STT Deepgram
+    // Instancier Deepgram
     this.deepgram = setupDeepgram(this);
 
-    // On va rien instancier en TTS WebSocket, car on va utiliser ElevenLabs par REST
-    // Mais on attend que l'utilisateur décroche => start event
-    // => Ou on peut lire direct
-    // On peut "speak" initialAssistantMessage juste après la connexion
     this.connection.on("message", this.processMessage.bind(this));
     this.connection.on("close", this.close.bind(this));
   }
@@ -209,8 +189,8 @@ class MediaStream {
           break;
         case "start":
           console.log("twilio: start =>", data);
-          // On parle le message initial
-          this.speak(initialAssistantMessage);
+          // Lire le message initial
+          this.speak(initialAssistantMessage).catch((err) => console.error(err));
           break;
         case "media":
           if (!this.hasSeenMedia) {
@@ -236,22 +216,22 @@ class MediaStream {
   }
 
   async speak(text) {
-    // speaking => on va refuser l'interruption d'un TTS en cours
+    // speaking => on va refuser l’interruption d’un TTS en cours par un autre speak
     speaking = true;
-    firstByte = true;
-    ttsStart = Date.now();
-    send_first_sentence_input_time = null;
-
+    ttsAbort = false; // <-- reset abort
     try {
-      // 1) Appel ElevenLabs: GET audio
       const audioBuffer = await synthesizeElevenLabs(text);
-
-      // 2) Convertir l'audio en mulaw 8kHz (Buffer)
+      // Vérifie si l’utilisateur a parlé entre temps
+      if (ttsAbort) {
+        console.log("speak => TTS abort triggered, skipping audio send");
+        return;
+      }
+      // Convertir l’audio en mu-law
       const mulawBuffer = await convertToMulaw8k(audioBuffer);
+      if (ttsAbort) return;
 
-      // 3) Envoyer ce mulawBuffer sous forme de payload base64 en "media" events => Twilio
+      // Envoi par chunk
       this.sendAudioInChunks(mulawBuffer);
-
     } catch (err) {
       console.error("Error in speak =>", err);
     } finally {
@@ -259,13 +239,9 @@ class MediaStream {
     }
   }
 
-  /**
-   * Découpe le buffer mu-law en paquets
-   * et envoie des events "media" à Twilio via .connection.sendUTF(...)
-   */
-  sendAudioInChunks(mulawBuf, chunkSize = 2000) {
+  sendAudioInChunks(mulawBuf, chunkSize = 4000) {
     let offset = 0;
-    while (offset < mulawBuf.length) {
+    while (offset < mulawBuf.length && !ttsAbort) {
       const end = Math.min(offset + chunkSize, mulawBuf.length);
       const slice = mulawBuf.slice(offset, end);
       offset = end;
@@ -286,7 +262,7 @@ class MediaStream {
 }
 
 //------------------------------------------
-// Setup Deepgram STT (identique)
+// Setup Deepgram
 //------------------------------------------
 function setupDeepgram(mediaStream) {
   let is_finals = [];
@@ -320,18 +296,25 @@ function setupDeepgram(mediaStream) {
           is_finals = [];
           console.log("deepgram STT => speech_final =>", utterance);
 
+          // On coupe le TTS
           speaking = false;
+          ttsAbort = true;
+
           conversation.push({ role: "user", content: utterance });
           callGPT(mediaStream);
         } else {
           console.log("deepgram STT => final =>", transcript);
         }
       } else {
+        // Interim
         console.log("deepgram STT => interim =>", transcript);
+
+        // <-- MODIF: On arrête le TTS en cours si l’utilisateur parle
+        //     On stoppe tout en fixant ttsAbort = true
         if (speaking) {
           console.log("interrupt TTS => user is speaking");
-          // Envoyer un event "clear" ? A toi de voir
           speaking = false;
+          ttsAbort = true;
         }
       }
     });
@@ -343,6 +326,8 @@ function setupDeepgram(mediaStream) {
         console.log("deepgram STT => utteranceEnd =>", utterance);
 
         speaking = false;
+        ttsAbort = true;
+
         conversation.push({ role: "user", content: utterance });
         callGPT(mediaStream);
       }
@@ -362,13 +347,12 @@ function setupDeepgram(mediaStream) {
 }
 
 //------------------------------------------
-// callGPT => streaming GPT (identique)
+// GPT streaming
 //------------------------------------------
 async function callGPT(mediaStream) {
   console.log("callGPT => conversation so far:", conversation);
   speaking = true;
-  let firstToken = true;
-  llmStart = Date.now();
+  ttsAbort = false;
 
   const stream = openai.beta.chat.completions.stream({
     model: "gpt-3.5-turbo",
@@ -380,65 +364,61 @@ async function callGPT(mediaStream) {
   });
 
   let assistantReply = "";
-  let partialSentence = "";
+  // <-- MODIF: On accumule la réponse GPT en “paragraphes”
+  //    pour éviter de speak() chaque petite phrase.
+  //    On peut déclencher un speak() après ~2 phrases ou >150 caractères, etc.
+  let partialBuffer = "";
 
   for await (const chunk of stream) {
-    if (!speaking) break;
-    if (firstToken) {
-      firstToken = false;
-      firstByte = true;
-      ttsStart = Date.now();
-      const t = Date.now() - llmStart;
-      console.log("GPT => time to first token =", t, "ms");
+    if (!speaking || ttsAbort) {
+      break;
     }
     const chunkMessage = chunk.choices[0].delta.content;
     if (chunkMessage) {
       assistantReply += chunkMessage;
+      partialBuffer += chunkMessage;
 
-      // ICI, on pourrait accumuler par phrase, puis speak chaque phrase
-      // pour faire un "streaming" pseudo temps réel
-      partialSentence += chunkMessage;
-      if (/[.!?]/.test(partialSentence)) {
-        // On a atteint une fin de phrase
-        let phraseToSpeak = partialSentence;
-        partialSentence = "";
-        // TTS ElevenLabs sur phraseToSpeak
-        await mediaStream.speak(phraseToSpeak);
+      // Regarde si on a assez de texte pour parler un “bloc”
+      // Ex: on se base sur ponctuation + longueur
+      if (/[.!?]/.test(partialBuffer) && partialBuffer.length > 120) {
+        // On “speak” ce bloc
+        const toSpeak = partialBuffer.trim();
+        partialBuffer = "";
+        await mediaStream.speak(toSpeak);
+
+        // Vérifie si l'utilisateur a interrompu
+        if (ttsAbort) break;
       }
     }
   }
-  // Fin du stream GPT
-  if (partialSentence.trim()) {
-    // parler la dernière portion
-    await mediaStream.speak(partialSentence);
+
+  // S’il reste un bout de phrase non joué, on le joue
+  if (partialBuffer.trim() && !ttsAbort) {
+    await mediaStream.speak(partialBuffer.trim());
   }
 
+  // On ajoute la réponse GPT complète à la conversation
   if (assistantReply.trim()) {
     conversation.push({ role: "assistant", content: assistantReply });
   }
+
   speaking = false;
 }
 
 //------------------------------------------
 // 2) Fonctions utilitaires TTS ElevenLabs
 //------------------------------------------
-
-/**
- * Va faire un call à ElevenLabs en POST, endpoint /v1/text-to-speech/<voice_id>
- * Retourne un buffer audio (par défaut MP3).
- */
 async function synthesizeElevenLabs(text) {
   if (!ELEVENLABS_API_KEY) {
     throw new Error("ELEVENLABS_API_KEY is missing");
   }
-  // Voir doc: https://api.elevenlabs.io/v1/text-to-speech
   const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream`;
   const body = {
     text,
     model_id: "eleven_multilingual_v2",
     voice_settings: {
-      stability: 0.75,
-      similarity_boost: 0.82,
+      stability: ELEVENLABS_STABILITY,      // <-- MODIF
+      similarity_boost: ELEVENLABS_SIMILARITY, // <-- MODIF
     },
   };
   const resp = await axios.post(url, body, {
@@ -452,18 +432,12 @@ async function synthesizeElevenLabs(text) {
   return Buffer.from(resp.data); // MP3 data
 }
 
-/**
- * Convertit un buffer audio (MP3 par ex) en mu-law 8kHz
- * On s'appuie sur ffmpeg en CLI
- */
 function convertToMulaw8k(mp3Buffer) {
   return new Promise((resolve, reject) => {
-    // Écrire mp3Buffer dans un fichier temp
     const inputFile = "temp_in.mp3";
     const outputFile = "temp_out.ulaw";
     fs.writeFileSync(inputFile, mp3Buffer);
 
-    // lancer ffmpeg: ffmpeg -y -i temp_in.mp3 -ar 8000 -f mulaw temp_out.ulaw
     const ffmpegArgs = [
       "-y",
       "-i",
@@ -482,9 +456,7 @@ function convertToMulaw8k(mp3Buffer) {
       if (code !== 0) {
         return reject(new Error(`ffmpeg process exited with code ${code}`));
       }
-      // Lire le fichier outputFile
       const ulawData = fs.readFileSync(outputFile);
-      // Cleanup
       fs.unlinkSync(inputFile);
       fs.unlinkSync(outputFile);
       resolve(ulawData);
