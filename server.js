@@ -47,11 +47,22 @@ let ttsAbort = false;
 let lastUtteranceId = 0;
 
 //------------------------------------------
-// Serveur HTTP
+// Serveur HTTP avec logging
 //------------------------------------------
 const server = http.createServer(async (req, res) => {
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
+
   const parsedUrl = url.parse(req.url, true);
   const pathname = parsedUrl.pathname;
+
+  // Middleware de timeout global
+  res.setTimeout(10000, () => {
+    if (!res.headersSent) {
+      console.error("Timeout global déclenché");
+      res.writeHead(504, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Gateway Timeout" }));
+    }
+  });
 
   if (req.method === "GET" && pathname === "/") {
     res.writeHead(200, { "Content-Type": "text/plain" });
@@ -83,9 +94,63 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "POST" && pathname === "/outbound") {
     let body = "";
     req.on("data", (chunk) => (body += chunk));
+    
     req.on("end", async () => {
-      // ... (Garder le code Twilio original ici)
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 8000);
+
+      try {
+        const parsed = JSON.parse(body);
+        
+        if (!parsed.to) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          return res.end(JSON.stringify({ error: "'to' missing" }));
+        }
+
+        if (!twilioClient) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          return res.end(JSON.stringify({ error: "Twilio not configured" }));
+        }
+
+        const fromNumber = process.env.TWILIO_PHONE_NUMBER;
+        const domain = process.env.SERVER?.replace(/^https?:\/\//, "") || "localhost";
+        const twimlUrl = `https://${domain}/twiml`;
+
+        console.log(`Init call to ${parsed.to}`);
+        const call = await twilioClient.calls.create({
+          to: parsed.to,
+          from: fromNumber,
+          url: twimlUrl,
+          method: "POST",
+          timeout: 7,
+          signal: controller.signal
+        });
+
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: true, callSid: call.sid }));
+
+      } catch (err) {
+        console.error("Outbound error:", err);
+        const statusCode = err.name === 'AbortError' ? 504 : 500;
+        res.writeHead(statusCode, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ 
+          error: err.name === 'AbortError' 
+            ? "Twilio call timeout" 
+            : err.message 
+        }));
+      } finally {
+        clearTimeout(timeout);
+      }
     });
+
+    req.on("error", (err) => {
+      console.error("Request error:", err);
+      if (!res.headersSent) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Internal server error" }));
+      }
+    });
+
     return;
   }
 
@@ -307,9 +372,15 @@ function setupDeepgram(mediaStream) {
   return dgLive;
 }
 
+
 //------------------------------------------
-// Start Server
+// Démarrage du serveur avec validation d'environnement
 //------------------------------------------
 server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
+  
+  // Validation des variables critiques
+  if (!process.env.DEEPGRAM_API_KEY) console.error("DEEPGRAM_API_KEY manquant !");
+  if (!ELEVENLABS_API_KEY) console.error("ELEVENLABS_API_KEY manquant !");
+  if (!accountSid || !authToken) console.error("Identifiants Twilio manquants !");
 });
