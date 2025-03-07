@@ -7,7 +7,7 @@ const { server: WebSocketServer } = require("websocket");
 const axios = require("axios");
 const { spawn } = require("child_process");
 
-// Twilio
+// Twilio Configuration
 const accountSid = process.env.TWILIO_ACCOUNT_SID;
 const authToken = process.env.TWILIO_AUTH_TOKEN;
 let twilioClient = null;
@@ -19,11 +19,11 @@ if (accountSid && authToken) {
   console.warn("Twilio credentials missing => no outbound calls");
 }
 
-// Deepgram
+// Deepgram Configuration
 const { createClient, LiveTranscriptionEvents } = require("@deepgram/sdk");
 const deepgramClient = createClient(process.env.DEEPGRAM_API_KEY);
 
-// OpenAI
+// OpenAI Configuration
 const OpenAI = require("openai");
 const openai = new OpenAI();
 
@@ -41,10 +41,99 @@ const CONVERSATION_HISTORY_LIMIT = 6;
 
 const PORT = process.env.PORT || 8080;
 
-// ... [Le code du serveur HTTP reste identique jusqu'à la classe MediaStream]
+//------------------------------------------
+// Serveur HTTP
+//------------------------------------------
+const server = http.createServer(async (req, res) => {
+  const parsedUrl = url.parse(req.url, true);
+  const pathname = parsedUrl.pathname;
+
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
+
+  if (req.method === "GET" && pathname === "/") {
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    return res.end("Hello, your server is running.");
+  }
+
+  if (req.method === "POST" && pathname === "/ping") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ message: "pong" }));
+  }
+
+  if (req.method === "POST" && pathname === "/twiml") {
+    try {
+      const filePath = path.join(__dirname, "templates", "streams.xml");
+      let streamsXML = fs.readFileSync(filePath, "utf8");
+      let serverUrl = process.env.SERVER || "localhost";
+      serverUrl = serverUrl.replace(/^https?:\/\//, "");
+      streamsXML = streamsXML.replace("<YOUR NGROK URL>", serverUrl);
+
+      res.writeHead(200, { "Content-Type": "text/xml" });
+      return res.end(streamsXML);
+    } catch (err) {
+      console.error("Error reading streams.xml:", err);
+      res.writeHead(500, { "Content-Type": "text/plain" });
+      return res.end("Internal Server Error (twiml)");
+    }
+  }
+
+  if (req.method === "POST" && pathname === "/outbound") {
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    
+    req.on("end", async () => {
+      try {
+        const parsed = JSON.parse(body);
+        if (!parsed.to) throw new Error("'to' missing");
+        if (!twilioClient) throw new Error("Twilio not configured");
+
+        const domain = (process.env.SERVER || "").replace(/\/$/, "");
+        const twimlUrl = `${domain}/twiml`;
+        const fromNumber = process.env.TWILIO_PHONE_NUMBER || "+15017122661";
+
+        const call = await twilioClient.calls.create({
+          to: parsed.to,
+          from: fromNumber,
+          url: twimlUrl,
+          method: "POST",
+          timeout: 15
+        });
+
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: true, callSid: call.sid }));
+      } catch (err) {
+        console.error("Outbound error:", err);
+        res.writeHead(err.status || 500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    
+    return;
+  }
+
+  res.writeHead(404, { "Content-Type": "text/plain" });
+  res.end("Not Found");
+});
 
 //------------------------------------------
-// Classe MediaStream modifiée
+// WebSocket Server
+//------------------------------------------
+const wsServer = new WebSocketServer({
+  httpServer: server,
+  autoAcceptConnections: false,
+});
+
+wsServer.on("request", (request) => {
+  if (request.resourceURL.pathname === "/streams") {
+    const connection = request.accept(null, request.origin);
+    new MediaStream(connection);
+  } else {
+    request.reject();
+  }
+});
+
+//------------------------------------------
+// Classe MediaStream améliorée
 //------------------------------------------
 class MediaStream {
   constructor(connection) {
@@ -60,10 +149,150 @@ class MediaStream {
     this.setupEventHandlers();
   }
 
-  // ... [Les autres méthodes restent identiques jusqu'à generateResponse]
+  setupEventHandlers() {
+    this.connection.on("message", (message) => {
+      if (message.type === "utf8") {
+        const data = JSON.parse(message.utf8Data);
+        this.handleProtocolMessage(data);
+      }
+    });
+
+    this.connection.on("close", () => {
+      this.active = false;
+      this.deepgram.finish();
+      console.log("Connection closed");
+    });
+  }
+
+  handleProtocolMessage(data) {
+    switch (data.event) {
+      case "media":
+        if (data.media.track === "inbound") {
+          if (!this.streamSid) this.streamSid = data.streamSid;
+          this.processAudio(data.media.payload);
+        }
+        break;
+      case "start":
+        this.startConversation();
+        break;
+    }
+  }
+
+  async startConversation() {
+    await this.speakWithDelay(initialAssistantMessage, 1000);
+  }
+
+  async processAudio(payload) {
+    try {
+      const rawAudio = Buffer.from(payload, "base64");
+      this.deepgram.send(rawAudio);
+    } catch (err) {
+      console.error("Audio processing error:", err);
+    }
+  }
 
   //------------------------------------------
-  // Nouvelle version de generateResponse
+  // Gestion TTS améliorée
+  //------------------------------------------
+  async speak(text) {
+    if (!this.active) return;
+
+    try {
+      const audioBuffer = await this.synthesizeSpeech(text);
+      const mulawBuffer = await this.convertAudio(audioBuffer);
+      this.sendAudioChunks(mulawBuffer);
+    } catch (err) {
+      console.error("TTS error:", err);
+    }
+  }
+
+  async synthesizeSpeech(text) {
+    const response = await axios.post(
+      `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream`,
+      {
+        text,
+        model_id: "eleven_multilingual_v2",
+        voice_settings: {
+          stability: ELEVENLABS_STABILITY,
+          similarity_boost: ELEVENLABS_SIMILARITY
+        }
+      },
+      {
+        headers: {
+          "xi-api-key": ELEVENLABS_API_KEY,
+          "Content-Type": "application/json"
+        },
+        responseType: "arraybuffer"
+      }
+    );
+    return response.data;
+  }
+
+  async convertAudio(mp3Buffer) {
+    return new Promise((resolve, reject) => {
+      const ffmpeg = spawn("ffmpeg", [
+        "-i", "pipe:0",
+        "-ar", "8000",
+        "-ac", "1",
+        "-f", "mulaw",
+        "pipe:1"
+      ]);
+
+      const chunks = [];
+      ffmpeg.stdout.on("data", chunk => chunks.push(chunk));
+      ffmpeg.on("close", code => code === 0 
+        ? resolve(Buffer.concat(chunks)) 
+        : reject(new Error(`FFmpeg error ${code}`))
+      );
+      
+      ffmpeg.stdin.write(mp3Buffer);
+      ffmpeg.stdin.end();
+    });
+  }
+
+  sendAudioChunks(buffer, chunkSize = 4000) {
+    for (let offset = 0; offset < buffer.length; offset += chunkSize) {
+      const chunk = buffer.slice(offset, offset + chunkSize);
+      this.connection.sendUTF(JSON.stringify({
+        event: "media",
+        streamSid: this.streamSid,
+        media: { payload: chunk.toString("base64") }
+      }));
+    }
+  }
+
+  //------------------------------------------
+  // Configuration Deepgram optimisée
+  //------------------------------------------
+  setupDeepgram() {
+    this.deepgram = deepgramClient.listen.live({
+      model: "nova-2",
+      language: "fr-FR",
+      endpointing: 300,
+      interim_results: false,
+      encoding: "mulaw",
+      sample_rate: 8000
+    });
+
+    this.deepgram.addListener(LiveTranscriptionEvents.Transcript, (data) => {
+      if (data.speech_final && data.is_final) {
+        const transcript = data.channel.alternatives[0].transcript;
+        this.handleUserInput(transcript);
+      }
+    });
+  }
+
+  async handleUserInput(transcript) {
+    if (!this.active) return;
+
+    this.conversation.push({ role: "user", content: transcript });
+    this.conversation = this.conversation.slice(-CONVERSATION_HISTORY_LIMIT);
+    
+    await this.generateResponse();
+  }
+
+  //------------------------------------------
+  // Génération de réponse avec GPT-4o
   //------------------------------------------
   async generateResponse() {
     try {
@@ -82,7 +311,6 @@ class MediaStream {
       let partialBuffer = "";
       let isInterrupted = false;
 
-      // Délai naturel avant réponse
       await this.sleep(300 + Math.random() * 400);
 
       for await (const chunk of stream) {
@@ -92,7 +320,6 @@ class MediaStream {
         fullResponse += content;
         partialBuffer += content;
 
-        // Déclenchement TTS plus réactif
         if (/[.!?]/.test(partialBuffer) && partialBuffer.length > 60) {
           const toSpeak = partialBuffer.trim();
           partialBuffer = "";
@@ -101,7 +328,6 @@ class MediaStream {
         }
       }
 
-      // Gestion du reste du buffer
       if (this.active && partialBuffer.trim()) {
         if (partialBuffer.length < 40 && Math.random() > 0.5) {
           partialBuffer = this.randomBackchannel();
@@ -115,37 +341,28 @@ class MediaStream {
     }
   }
 
-  // ... [Les méthodes utilitaires restent identiques]
-}
-
-//------------------------------------------
-// Fonctions utilitaires TTS ElevenLabs
-//------------------------------------------
-async function synthesizeElevenLabs(text) {
-  if (!ELEVENLABS_API_KEY) {
-    throw new Error("ELEVENLABS_API_KEY is missing");
+  //------------------------------------------
+  // Utilitaires
+  //------------------------------------------
+  async speakWithDelay(text, delay = 300) {
+    await this.sleep(delay);
+    return this.speak(text);
   }
-  
-  const response = await axios.post(
-    `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream`,
-    {
-      text,
-      model_id: "eleven_multilingual_v2",
-      voice_settings: {
-        stability: ELEVENLABS_STABILITY,
-        similarity_boost: ELEVENLABS_SIMILARITY
-      }
-    },
-    {
-      headers: {
-        "xi-api-key": ELEVENLABS_API_KEY,
-        "Content-Type": "application/json"
-      },
-      responseType: "arraybuffer"
-    }
-  );
-  
-  return response.data;
+
+  sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  randomBackchannel() {
+    return BACKCHANNELS[Math.floor(Math.random() * BACKCHANNELS.length)];
+  }
 }
 
-// ... [Le reste du code reste inchangé]
+//------------------------------------------
+// Démarrage du serveur
+//------------------------------------------
+server.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  if (!process.env.DEEPGRAM_API_KEY) console.error("DEEPGRAM_API_KEY manquant !");
+  if (!ELEVENLABS_API_KEY) console.error("ELEVENLABS_API_KEY manquant !");
+});
