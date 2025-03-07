@@ -77,46 +77,33 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
- // Modifier la partie /outbound comme suit :
-if (req.method === "POST" && pathname === "/outbound") {
-  let body = "";
-  req.on("data", (chunk) => (body += chunk));
-  
-  req.on("end", async () => {
-    try {
-      const parsed = JSON.parse(body);
-      if (!parsed.to) throw new Error("'to' missing");
-      if (!twilioClient) throw new Error("Twilio not configured");
+  if (req.method === "POST" && pathname === "/outbound") {
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    
+    req.on("end", async () => {
+      try {
+        const parsed = JSON.parse(body);
+        if (!parsed.to) throw new Error("'to' missing");
+        if (!twilioClient) throw new Error("Twilio not configured");
 
-      // Correction du format de l'URL
-      let domain = process.env.SERVER || "";
-      if (!domain.match(/^https?:\/\//)) {
-        domain = `https://${domain.replace(/^\/|\/$/g, "")}`;
-      }
-      const twimlUrl = `${domain}/twiml`;
+        // Correction de l'URL
+        let domain = process.env.SERVER || "";
+        if (!domain.match(/^https?:\/\//)) {
+          domain = `https://${domain.replace(/^\/|\/$/g, "")}`;
+        }
+        const twimlUrl = `${domain}/twiml`;
 
-      const fromNumber = process.env.TWILIO_PHONE_NUMBER || "+15017122661";
-      console.log("Calling to:", parsed.to, "Twiml URL:", twimlUrl);
+        const fromNumber = process.env.TWILIO_PHONE_NUMBER || "+15017122661";
+        console.log("Calling to:", parsed.to, "Twiml URL:", twimlUrl);
 
-      const call = await twilioClient.calls.create({
-        to: parsed.to,
-        from: fromNumber,
-        url: twimlUrl,
-        method: "POST",
-        timeout: 15
-      });
-
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ success: true, callSid: call.sid }));
-    } catch (err) {
-      console.error("Outbound error:", err);
-      res.writeHead(err.status || 500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: err.message }));
-    }
-  });
-  
-  return;
-}
+        const call = await twilioClient.calls.create({
+          to: parsed.to,
+          from: fromNumber,
+          url: twimlUrl,
+          method: "POST",
+          timeout: 15
+        });
 
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ success: true, callSid: call.sid }));
@@ -152,7 +139,7 @@ wsServer.on("request", (request) => {
 });
 
 //------------------------------------------
-// Classe MediaStream améliorée
+// Classe MediaStream
 //------------------------------------------
 class MediaStream {
   constructor(connection) {
@@ -210,9 +197,6 @@ class MediaStream {
     }
   }
 
-  //------------------------------------------
-  // Gestion TTS améliorée
-  //------------------------------------------
   async speak(text) {
     if (!this.active) return;
 
@@ -280,9 +264,6 @@ class MediaStream {
     }
   }
 
-  //------------------------------------------
-  // Configuration Deepgram optimisée
-  //------------------------------------------
   setupDeepgram() {
     this.deepgram = deepgramClient.listen.live({
       model: "nova-2",
@@ -310,9 +291,6 @@ class MediaStream {
     await this.generateResponse();
   }
 
-  //------------------------------------------
-  // Génération de réponse avec GPT-4o
-  //------------------------------------------
   async generateResponse() {
     try {
       const stream = openai.beta.chat.completions.stream({
@@ -328,7 +306,6 @@ class MediaStream {
 
       let fullResponse = "";
       let partialBuffer = "";
-      let isInterrupted = false;
 
       await this.sleep(300 + Math.random() * 400);
 
@@ -360,9 +337,6 @@ class MediaStream {
     }
   }
 
-  //------------------------------------------
-  // Utilitaires
-  //------------------------------------------
   async speakWithDelay(text, delay = 300) {
     await this.sleep(delay);
     return this.speak(text);
