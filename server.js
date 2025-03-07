@@ -31,38 +31,21 @@ const openai = new OpenAI();
 // ElevenLabs
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || "";
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "WQKwBV2Uzw1gSGr69N8I";
-const ELEVENLABS_STABILITY = 0.35;
-const ELEVENLABS_SIMILARITY = 0.85;
-const BACKCHANNELS = ["D'accord", "Je vois", "Très bien", "Hmm"];
+const ELEVENLABS_STABILITY = 0.35; // Plus naturel
+const ELEVENLABS_SIMILARITY = 0.85; // Plus expressif
+const BACKCHANNELS = ["D'accord", "Je vois", "Très bien", "Hmm"]; // Réponses courtes
 
 // Configuration
-const systemMessage = `Tu es Pam, un agent téléphonique IA...`;
-const initialAssistantMessage = `Bonjour ! Je suis Pam, ton agent téléphonique IA...`;
+const systemMessage = `Tu es Pam, un agent téléphonique IA conçu pour démontrer les capacités de notre solution SaaS...`;
+const initialAssistantMessage = `Bonjour ! Je suis Pam, ton agent téléphonique IA. Merci d’avoir rempli le formulaire...`;
 const PORT = process.env.PORT || 8080;
-let streamSid = "";
-let keepAlive;
-let conversation = [];
-let speaking = false;
-let ttsAbort = false;
-let lastUtteranceId = 0;
 
 //------------------------------------------
-// Serveur HTTP avec logging
+// Serveur HTTP
 //------------------------------------------
 const server = http.createServer(async (req, res) => {
-  console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
-
   const parsedUrl = url.parse(req.url, true);
   const pathname = parsedUrl.pathname;
-
-  // Middleware de timeout global
-  res.setTimeout(10000, () => {
-    if (!res.headersSent) {
-      console.error("Timeout global déclenché");
-      res.writeHead(504, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Gateway Timeout" }));
-    }
-  });
 
   if (req.method === "GET" && pathname === "/") {
     res.writeHead(200, { "Content-Type": "text/plain" });
@@ -92,65 +75,48 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.method === "POST" && pathname === "/outbound") {
+    console.log("POST /outbound");
     let body = "";
     req.on("data", (chunk) => (body += chunk));
-    
     req.on("end", async () => {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 8000);
+      let parsed;
+      try {
+        parsed = JSON.parse(body);
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ error: "Invalid JSON" }));
+      }
+      const toNumber = parsed.to;
+      if (!toNumber) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ error: "'to' missing" }));
+      }
+      if (!twilioClient) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ error: "Twilio not configured" }));
+      }
+      let domain = process.env.SERVER || "";
+      if (!domain.startsWith("http")) domain = "https://" + domain;
+      domain = domain.replace(/\/$/, "");
+      const twimlUrl = `${domain}/twiml`;
 
       try {
-        const parsed = JSON.parse(body);
-        
-        if (!parsed.to) {
-          res.writeHead(400, { "Content-Type": "application/json" });
-          return res.end(JSON.stringify({ error: "'to' missing" }));
-        }
-
-        if (!twilioClient) {
-          res.writeHead(500, { "Content-Type": "application/json" });
-          return res.end(JSON.stringify({ error: "Twilio not configured" }));
-        }
-
-        const fromNumber = process.env.TWILIO_PHONE_NUMBER;
-        const domain = process.env.SERVER?.replace(/^https?:\/\//, "") || "localhost";
-        const twimlUrl = `https://${domain}/twiml`;
-
-        console.log(`Init call to ${parsed.to}`);
+        const fromNumber = process.env.TWILIO_PHONE_NUMBER || "+15017122661";
+        console.log("calling =>", toNumber, "from=>", fromNumber, "url=>", twimlUrl);
         const call = await twilioClient.calls.create({
-          to: parsed.to,
+          to: toNumber,
           from: fromNumber,
           url: twimlUrl,
           method: "POST",
-          timeout: 7,
-          signal: controller.signal
         });
-
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ success: true, callSid: call.sid }));
-
+        return res.end(JSON.stringify({ success: true, callSid: call.sid }));
       } catch (err) {
-        console.error("Outbound error:", err);
-        const statusCode = err.name === 'AbortError' ? 504 : 500;
-        res.writeHead(statusCode, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ 
-          error: err.name === 'AbortError' 
-            ? "Twilio call timeout" 
-            : err.message 
-        }));
-      } finally {
-        clearTimeout(timeout);
-      }
-    });
-
-    req.on("error", (err) => {
-      console.error("Request error:", err);
-      if (!res.headersSent) {
+        console.error("Twilio error =>", err);
         res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Internal server error" }));
+        return res.end(JSON.stringify({ error: err.message }));
       }
     });
-
     return;
   }
 
@@ -159,7 +125,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 //------------------------------------------
-// WebSocket Server
+// WebSocket /streams
 //------------------------------------------
 const wsServer = new WebSocketServer({
   httpServer: server,
@@ -168,36 +134,37 @@ const wsServer = new WebSocketServer({
 
 wsServer.on("request", (request) => {
   if (request.resourceURL.pathname === "/streams") {
+    console.log("/streams => accepted");
     const connection = request.accept(null, request.origin);
     new MediaStream(connection);
   } else {
     request.reject();
+    console.log("/streams => rejected");
   }
 });
 
 //------------------------------------------
-// MediaStream Class
+// Classe MediaStream améliorée
 //------------------------------------------
 class MediaStream {
   constructor(connection) {
     this.connection = connection;
-    this.hasSeenMedia = false;
-    conversation = [{ role: "assistant", content: initialAssistantMessage }];
-    this.deepgram = setupDeepgram(this);
+    this.streamSid = "";
+    this.activeUtteranceId = 0;
+    this.conversation = [{ role: "assistant", content: initialAssistantMessage }];
+    this.deepgram = this.setupDeepgram();
+    
     this.connection.on("message", this.processMessage.bind(this));
     this.connection.on("close", this.close.bind(this));
   }
 
-  async processMessage(message) {
+  processMessage(message) {
     if (message.type === "utf8") {
       const data = JSON.parse(message.utf8Data);
       switch (data.event) {
-        case "connected":
-          console.log("Connected:", data);
-          break;
         case "start":
-          await new Promise(resolve => setTimeout(resolve, 200 + Math.random() * 300));
-          await this.speak(initialAssistantMessage);
+          this.streamSid = data.streamSid;
+          this.speakWithDelay(initialAssistantMessage);
           break;
         case "media":
           if (data.media.track === "inbound") {
@@ -205,101 +172,135 @@ class MediaStream {
             this.deepgram.send(rawAudio);
           }
           break;
-        case "close":
-          this.close();
-          break;
       }
     }
   }
 
+  async speakWithDelay(text) {
+    await new Promise(resolve => setTimeout(resolve, 500));
+    return this.speak(text);
+  }
+
   async speak(text) {
     const utteranceId = Date.now();
-    lastUtteranceId = utteranceId;
-    speaking = true;
-    ttsAbort = false;
-
+    this.activeUtteranceId = utteranceId;
+    
     try {
       const audioBuffer = await synthesizeElevenLabs(text);
-      if (ttsAbort || utteranceId !== lastUtteranceId) return;
+      if (this.activeUtteranceId !== utteranceId) return;
 
       const mulawBuffer = await convertToMulaw8k(audioBuffer);
-      if (ttsAbort || utteranceId !== lastUtteranceId) return;
+      if (this.activeUtteranceId !== utteranceId) return;
 
       this.sendAudioInChunks(mulawBuffer);
     } catch (err) {
       console.error("Speak error:", err);
-    } finally {
-      if (utteranceId === lastUtteranceId) speaking = false;
     }
   }
 
   sendAudioInChunks(mulawBuf, chunkSize = 4000) {
     let offset = 0;
-    while (offset < mulawBuf.length && !ttsAbort) {
+    while (offset < mulawBuf.length && this.activeUtteranceId === Date.now()) {
       const slice = mulawBuf.slice(offset, offset + chunkSize);
       offset += chunkSize;
+      
       const msg = {
         event: "media",
-        streamSid,
+        streamSid: this.streamSid,
         media: { payload: slice.toString("base64") },
       };
       this.connection.sendUTF(JSON.stringify(msg));
     }
   }
 
+  setupDeepgram() {
+    const dgLive = deepgramClient.listen.live({
+      model: "nova-2-general",
+      language: "fr-FR",
+      endpointing: 250,
+      utterance_end_ms: 600,
+      interim_results: true,
+      encoding: "mulaw",
+      sample_rate: 8000
+    });
+
+    dgLive.addListener(LiveTranscriptionEvents.Transcript, (data) => {
+      if (data.is_final && data.speech_final) {
+        const transcript = data.channel.alternatives[0].transcript;
+        console.log("User said:", transcript);
+        
+        // Interruption de l'audio en cours
+        this.activeUtteranceId = Date.now();
+        this.conversation.push({ role: "user", content: transcript });
+        this.processResponse();
+      }
+    });
+
+    return dgLive;
+  }
+
+  async processResponse() {
+    await new Promise(resolve => setTimeout(resolve, 300 + Math.random() * 400));
+    await callGPT(this);
+  }
+
   close() {
     console.log("Connection closed");
+    this.deepgram.finish();
   }
 }
 
 //------------------------------------------
-// GPT Functions
+// GPT amélioré avec gestion conversationnelle
 //------------------------------------------
 async function callGPT(mediaStream) {
-  conversation = conversation.slice(-6);
+  const context = mediaStream.conversation.slice(-4);
   
   const stream = openai.beta.chat.completions.stream({
     model: "gpt-3.5-turbo",
+    temperature: 0.7,
     messages: [
       { role: "system", content: systemMessage },
-      ...conversation
+      ...context
     ],
     stream: true
   });
 
+  let fullResponse = "";
   let sentenceBuffer = "";
-  let isInterrupted = false;
-  let assistantReply = "";
 
-  for await (const chunk of stream) {
-    if (ttsAbort) {
-      isInterrupted = true;
-      break;
-    }
-    
-    const chunkMessage = chunk.choices[0]?.delta?.content || "";
-    sentenceBuffer += chunkMessage;
-    assistantReply += chunkMessage;
+  try {
+    for await (const chunk of stream) {
+      const content = chunk.choices[0]?.delta?.content || "";
+      fullResponse += content;
+      sentenceBuffer += content;
 
-    const sentences = sentenceBuffer.split(/(?<=[.!?])\s+/);
-    if (sentences.length > 1) {
-      const toSpeak = sentences.slice(0, -1).join(" ");
-      sentenceBuffer = sentences[sentences.length - 1];
-      await mediaStream.speak(toSpeak);
+      // Découpage naturel des phrases
+      const sentences = sentenceBuffer.split(/(?<=[.!?])\s+/);
+      if (sentences.length > 1) {
+        const toSpeak = sentences.slice(0, -1).join(" ");
+        sentenceBuffer = sentences[sentences.length - 1];
+        await mediaStream.speak(toSpeak);
+      }
     }
-  }
 
-  if (!isInterrupted && sentenceBuffer.trim()) {
-    if (sentenceBuffer.length < 40 && Math.random() > 0.6) {
-      sentenceBuffer = BACKCHANNELS[Math.floor(Math.random() * BACKCHANNELS.length)];
+    // Gestion des réponses courtes
+    if (sentenceBuffer.trim()) {
+      if (sentenceBuffer.length < 50 && Math.random() > 0.5) {
+        sentenceBuffer = BACKCHANNELS[Math.floor(Math.random() * BACKCHANNELS.length)];
+      }
+      await mediaStream.speak(sentenceBuffer.trim());
     }
-    await mediaStream.speak(sentenceBuffer.trim());
-    conversation.push({ role: "assistant", content: assistantReply });
+
+    mediaStream.conversation.push({ role: "assistant", content: fullResponse });
+  } catch (err) {
+    console.error("GPT Error:", err);
+    await mediaStream.speak("Je rencontre un petit problème, pourriez-vous répéter ?");
   }
 }
 
 //------------------------------------------
-// TTS Functions
+// TTS Functions optimisées
 //------------------------------------------
 async function synthesizeElevenLabs(text) {
   const response = await axios.post(
@@ -336,9 +337,7 @@ function convertToMulaw8k(mp3Buffer) {
     const chunks = [];
     ffmpeg.stdout.on("data", chunk => chunks.push(chunk));
     ffmpeg.on("close", code => {
-      code === 0 
-        ? resolve(Buffer.concat(chunks)) 
-        : reject(new Error(`FFmpeg failed with code ${code}`));
+      code === 0 ? resolve(Buffer.concat(chunks)) : reject(`FFmpeg error ${code}`);
     });
 
     ffmpeg.stdin.write(mp3Buffer);
@@ -347,40 +346,8 @@ function convertToMulaw8k(mp3Buffer) {
 }
 
 //------------------------------------------
-// Deepgram Setup
-//------------------------------------------
-function setupDeepgram(mediaStream) {
-  const dgLive = deepgramClient.listen.live({
-    model: "nova-2-general",
-    language: "fr-FR",
-    endpointing: 500,
-    smart_format: true,
-    encoding: "mulaw",
-    sample_rate: 8000,
-    channels: 1
-  });
-
-  dgLive.addListener(LiveTranscriptionEvents.Transcript, (data) => {
-    if (data.is_final && speaking) {
-      ttsAbort = true;
-      speaking = false;
-      lastUtteranceId = Date.now();
-      conversation.pop();
-    }
-  });
-
-  return dgLive;
-}
-
-
-//------------------------------------------
-// Démarrage du serveur avec validation d'environnement
+// Lancement du serveur
 //------------------------------------------
 server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-  
-  // Validation des variables critiques
-  if (!process.env.DEEPGRAM_API_KEY) console.error("DEEPGRAM_API_KEY manquant !");
-  if (!ELEVENLABS_API_KEY) console.error("ELEVENLABS_API_KEY manquant !");
-  if (!accountSid || !authToken) console.error("Identifiants Twilio manquants !");
+  console.log("Server listening on port", PORT);
 });
