@@ -32,13 +32,11 @@ const openai = new OpenAI();
 // TTS ElevenLabs paramètres
 // -----------------------------
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || "";
-const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "WQKwBV2Uzw1gSGr69N8I"; // Exemple par défaut
+const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "WQKwBV2Uzw1gSGr69N8I";
 
-// Paramètres ajustés pour une voix plus naturelle
 const ELEVENLABS_STABILITY = 0.4;
 const ELEVENLABS_SIMILARITY = 0.9;
 
-// Script système et message initial
 const systemMessage = `Tu es Pam, un agent téléphonique IA conçu pour démontrer les capacités de notre solution SaaS...`;
 const initialAssistantMessage = `Bonjour ! Je suis Pam, ton agent téléphonique IA. Merci d’avoir rempli le formulaire ! Comment puis-je t’aider aujourd’hui ?`;
 
@@ -47,9 +45,8 @@ let streamSid = "";
 let keepAlive;
 let conversation = [];
 
-// Flags pour gérer le TTS et interruption
 let speaking = false;
-let ttsAbort = false; // Permet de stopper un TTS en cours
+let ttsAbort = false;
 
 //------------------------------------------
 // Serveur HTTP
@@ -73,11 +70,8 @@ const server = http.createServer(async (req, res) => {
       const filePath = path.join(__dirname, "templates", "streams.xml");
       let streamsXML = fs.readFileSync(filePath, "utf8");
       let serverUrl = process.env.SERVER || "localhost";
-      // Enlever le préfixe http:// ou https://
       serverUrl = serverUrl.replace(/^https?:\/\//, "");
       streamsXML = streamsXML.replace("<YOUR NGROK URL>", serverUrl);
-      console.log("streams.xml généré :", streamsXML); // Pour vérification
-
       res.writeHead(200, { "Content-Type": "text/xml" });
       return res.end(streamsXML);
     } catch (err) {
@@ -115,7 +109,6 @@ const server = http.createServer(async (req, res) => {
 
       try {
         const fromNumber = process.env.TWILIO_PHONE_NUMBER || "+15017122661";
-        console.log("calling =>", toNumber, "from=>", fromNumber, "url=>", twimlUrl);
         const call = await twilioClient.calls.create({
           to: toNumber,
           from: fromNumber,
@@ -133,7 +126,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // 404 pour les autres routes
   res.writeHead(404, { "Content-Type": "text/plain" });
   res.end("Not Found");
 });
@@ -146,7 +138,6 @@ const wsServer = new WebSocketServer({
   autoAcceptConnections: false,
 });
 
-// <-- MODIF : Accepter toute URL commençant par "/streams" pour être plus tolérant
 wsServer.on("request", (request) => {
   if (request.resourceURL.pathname.startsWith("/streams")) {
     console.log("/streams => accepted");
@@ -159,21 +150,22 @@ wsServer.on("request", (request) => {
 });
 
 //------------------------------------------
-// Classe MediaStream
+// Classe MediaStream avec gestion d'erreurs
 //------------------------------------------
 class MediaStream {
   constructor(connection) {
     this.connection = connection;
     this.hasSeenMedia = false;
 
-    // Reset de la conversation et ajout du message initial
-    conversation = [];
-    conversation.push({
-      role: "assistant",
-      content: initialAssistantMessage,
+    // Gestionnaire d'erreur global
+    this.connection.on('error', (err) => {
+      console.error("WebSocket connection error:", err);
+      this.close();
     });
 
-    // Instancier Deepgram pour le STT
+    conversation = [];
+    conversation.push({ role: "assistant", content: initialAssistantMessage });
+
     this.deepgram = setupDeepgram(this);
 
     this.connection.on("message", this.processMessage.bind(this));
@@ -188,13 +180,10 @@ class MediaStream {
           console.log("twilio: connected");
           break;
         case "start":
-          console.log("twilio: start =>", data);
-          // Démarrer immédiatement la lecture du message initial
           this.speak(initialAssistantMessage).catch((err) => console.error(err));
           break;
         case "media":
           if (!this.hasSeenMedia) {
-            console.log("twilio: first media =>", data);
             this.hasSeenMedia = true;
           }
           if (!streamSid) {
@@ -206,10 +195,7 @@ class MediaStream {
           }
           break;
         case "close":
-          console.log("twilio: close =>", data);
           this.close();
-          break;
-        default:
           break;
       }
     }
@@ -217,14 +203,11 @@ class MediaStream {
 
   async speak(text) {
     speaking = true;
-    ttsAbort = false; // réinitialise l'arrêt du TTS
+    ttsAbort = false;
 
     try {
       const audioBuffer = await synthesizeElevenLabs(text);
-      if (ttsAbort) {
-        console.log("speak => TTS abort triggered, skip sending audio");
-        return;
-      }
+      if (ttsAbort) return;
       const mulawBuffer = await convertToMulaw8k(audioBuffer);
       if (ttsAbort) return;
       this.sendAudioInChunks(mulawBuffer);
@@ -241,11 +224,10 @@ class MediaStream {
       const end = Math.min(offset + chunkSize, mulawBuf.length);
       const slice = mulawBuf.slice(offset, end);
       offset = end;
-      const payloadBase64 = slice.toString("base64");
       const msg = {
         event: "media",
         streamSid,
-        media: { payload: payloadBase64 },
+        media: { payload: slice.toString("base64") },
       };
       this.connection.sendUTF(JSON.stringify(msg));
     }
@@ -257,7 +239,7 @@ class MediaStream {
 }
 
 //------------------------------------------
-// Setup Deepgram STT
+// Deepgram avec gestion d'erreurs améliorée
 //------------------------------------------
 function setupDeepgram(mediaStream) {
   let is_finals = [];
@@ -269,9 +251,16 @@ function setupDeepgram(mediaStream) {
     sample_rate: 8000,
     channels: 1,
     no_delay: true,
-    endpointing: 200,         // <-- MODIF : réduction pour détecter plus vite la fin
-    utterance_end_ms: 400,    // <-- MODIF : fin d'utterance plus rapide
+    endpointing: 200,
+    utterance_end_ms: 400,
     interim_results: true,
+    url: "wss://api.deepgram.com/v1/listen",
+  });
+
+  // Gestionnaire d'erreur IMMÉDIAT
+  dgLive.addListener(LiveTranscriptionEvents.Error, (err) => {
+    console.error("deepgram STT => error", err);
+    mediaStream.connection.close();
   });
 
   if (keepAlive) clearInterval(keepAlive);
@@ -288,10 +277,7 @@ function setupDeepgram(mediaStream) {
       const charCount = transcript.trim().length;
 
       if (!data.is_final) {
-        console.log("deepgram STT => interim =>", transcript);
-        // Interruption seulement si l'interim est suffisamment long
         if ((wordCount >= 3 || charCount > 15) && speaking) {
-          console.log("interrupt TTS => user is speaking (long enough interim)");
           speaking = false;
           ttsAbort = true;
         }
@@ -302,14 +288,10 @@ function setupDeepgram(mediaStream) {
         is_finals.push(transcript);
         const utterance = is_finals.join(" ");
         is_finals = [];
-        console.log("deepgram STT => speech_final =>", utterance);
-        speaking = false;
-        ttsAbort = true;
         conversation.push({ role: "user", content: utterance });
         callGPT(mediaStream);
       } else {
         is_finals.push(transcript);
-        console.log("deepgram STT => final =>", transcript);
       }
     });
 
@@ -317,9 +299,6 @@ function setupDeepgram(mediaStream) {
       if (is_finals.length) {
         const utterance = is_finals.join(" ");
         is_finals = [];
-        console.log("deepgram STT => utteranceEnd =>", utterance);
-        speaking = false;
-        ttsAbort = true;
         conversation.push({ role: "user", content: utterance });
         callGPT(mediaStream);
       }
@@ -328,24 +307,15 @@ function setupDeepgram(mediaStream) {
     dgLive.addListener(LiveTranscriptionEvents.Close, () => {
       console.log("deepgram STT => disconnected");
       clearInterval(keepAlive);
-      dgLive.requestClose();
-    });
-
-    dgLive.addListener(LiveTranscriptionEvents.Error, (err) => {
-      console.error("deepgram STT => error", err);
     });
   });
   return dgLive;
 }
 
 //------------------------------------------
-// callGPT : streaming GPT completions
+// Reste du code inchangé
 //------------------------------------------
 async function callGPT(mediaStream) {
-  console.log("callGPT => conversation so far:", conversation);
-  speaking = true;
-  ttsAbort = false;
-
   const stream = openai.beta.chat.completions.stream({
     model: "gpt-3.5-turbo",
     stream: true,
@@ -364,7 +334,6 @@ async function callGPT(mediaStream) {
     if (chunkMessage) {
       assistantReply += chunkMessage;
       partialBuffer += chunkMessage;
-      // Déclenche le TTS dès que le bloc atteint ~60 caractères et se termine par une ponctuation
       if (/[.!?]/.test(partialBuffer) && partialBuffer.length > 60) {
         const toSpeak = partialBuffer.trim();
         partialBuffer = "";
@@ -382,28 +351,17 @@ async function callGPT(mediaStream) {
   speaking = false;
 }
 
-//------------------------------------------
-// Fonctions utilitaires TTS ElevenLabs
-//------------------------------------------
 async function synthesizeElevenLabs(text) {
   if (!ELEVENLABS_API_KEY) {
     throw new Error("ELEVENLABS_API_KEY is missing");
   }
   const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream`;
-  const body = {
-    text,
-    model_id: "eleven_multilingual_v2",
-    voice_settings: {
-      stability: ELEVENLABS_STABILITY,
-      similarity_boost: ELEVENLABS_SIMILARITY,
-    },
-  };
+  const body = { text, model_id: "eleven_multilingual_v2", voice_settings: {
+    stability: ELEVENLABS_STABILITY,
+    similarity_boost: ELEVENLABS_SIMILARITY,
+  }};
   const resp = await axios.post(url, body, {
-    headers: {
-      "xi-api-key": ELEVENLABS_API_KEY,
-      "Content-Type": "application/json",
-      Accept: "audio/mpeg",
-    },
+    headers: { "xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json", Accept: "audio/mpeg" },
     responseType: "arraybuffer",
   });
   return Buffer.from(resp.data);
@@ -415,39 +373,23 @@ function convertToMulaw8k(mp3Buffer) {
     const outputFile = "temp_out.ulaw";
     fs.writeFileSync(inputFile, mp3Buffer);
 
-    const ffmpegArgs = [
-      "-y",
-      "-i",
-      inputFile,
-      "-ar",
-      "8000",
-      "-ac",
-      "1",
-      "-f",
-      "mulaw",
-      outputFile,
-    ];
-    const ff = spawn("ffmpeg", ffmpegArgs);
+    const ff = spawn("ffmpeg", [
+      "-y", "-i", inputFile,
+      "-ar", "8000", "-ac", "1", "-f", "mulaw", outputFile
+    ]);
 
     ff.on("close", (code) => {
-      if (code !== 0) {
-        return reject(new Error(`ffmpeg process exited with code ${code}`));
-      }
+      if (code !== 0) return reject(new Error(`ffmpeg exited with code ${code}`));
       const ulawData = fs.readFileSync(outputFile);
       fs.unlinkSync(inputFile);
       fs.unlinkSync(outputFile);
       resolve(ulawData);
     });
 
-    ff.on("error", (err) => {
-      reject(err);
-    });
+    ff.on("error", reject);
   });
 }
 
-//------------------------------------------
-// Lancement du serveur
-//------------------------------------------
 server.listen(PORT, () => {
   console.log("Server listening on port", PORT);
 });
