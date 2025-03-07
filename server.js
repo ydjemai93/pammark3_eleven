@@ -435,6 +435,7 @@ async function synthesizeElevenLabs(text) {
   const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream`;
   const body = {
     text,
+    model_id: "eleven_multilingual_v2",
     voice_settings: {
       stability: 0.75,
       similarity_boost: 0.82,
