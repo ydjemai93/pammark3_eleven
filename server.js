@@ -7,7 +7,7 @@ const { server: WebSocketServer } = require("websocket");
 const axios = require("axios");
 const { spawn } = require("child_process");
 
-// Twilio Configuration
+// Configuration Twilio
 const accountSid = process.env.TWILIO_ACCOUNT_SID;
 const authToken = process.env.TWILIO_AUTH_TOKEN;
 let twilioClient = null;
@@ -19,21 +19,21 @@ if (accountSid && authToken) {
   console.warn("Twilio credentials missing => no outbound calls");
 }
 
-// Deepgram Configuration
+// Configuration Deepgram
 const { createClient, LiveTranscriptionEvents } = require("@deepgram/sdk");
 const deepgramClient = createClient(process.env.DEEPGRAM_API_KEY);
 
-// OpenAI Configuration
+// Configuration OpenAI
 const OpenAI = require("openai");
 const openai = new OpenAI();
 
-// ElevenLabs Configuration
+// Configuration ElevenLabs
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || "";
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "WQKwBV2Uzw1gSGr69N8I";
 const ELEVENLABS_STABILITY = 0.35;
 const ELEVENLABS_SIMILARITY = 0.85;
 
-// Conversation Settings
+// Paramètres de conversation
 const systemMessage = "Tu es un agent de call center empathique, patient et professionnel. Ta mission est d’aider les clients de manière concise et chaleureuse, en proposant des solutions adaptées à leurs besoins.";
 const initialAssistantMessage = "Bonjour ! Je suis Pam, ton agent téléphonique IA. Merci d’avoir rempli le formulaire...";
 const BACKCHANNELS = ["D'accord", "Je vois", "Très bien", "Hmm"];
@@ -87,7 +87,6 @@ const server = http.createServer(async (req, res) => {
         if (!parsed.to) throw new Error("'to' missing");
         if (!twilioClient) throw new Error("Twilio not configured");
 
-        // Correction de l'URL
         let domain = process.env.SERVER || "";
         if (!domain.match(/^https?:\/\//)) {
           domain = `https://${domain.replace(/^\/|\/$/g, "")}`;
@@ -139,7 +138,7 @@ wsServer.on("request", (request) => {
 });
 
 //------------------------------------------
-// Classe MediaStream
+// Classe MediaStream améliorée
 //------------------------------------------
 class MediaStream {
   constructor(connection) {
@@ -150,7 +149,10 @@ class MediaStream {
       { role: "system", content: systemMessage },
       { role: "assistant", content: initialAssistantMessage }
     ];
-    
+    this.isSpeaking = false;
+    this.currentUtteranceId = 0;
+    this.lastInterruption = 0;
+
     this.setupDeepgram();
     this.setupEventHandlers();
   }
@@ -198,14 +200,43 @@ class MediaStream {
   }
 
   async speak(text) {
-    if (!this.active) return;
+    if (!this.active || this.isSpeaking) {
+      console.log("Déjà en train de parler - Ignore");
+      return;
+    }
 
+    this.isSpeaking = true;
+    const utteranceId = ++this.currentUtteranceId;
+    
     try {
       const audioBuffer = await this.synthesizeSpeech(text);
+      if (utteranceId !== this.currentUtteranceId) return;
+
       const mulawBuffer = await this.convertAudio(audioBuffer);
-      this.sendAudioChunks(mulawBuffer);
+      if (utteranceId !== this.currentUtteranceId) return;
+
+      await this.sendAudioChunks(mulawBuffer, utteranceId);
     } catch (err) {
       console.error("TTS error:", err);
+    } finally {
+      if (utteranceId === this.currentUtteranceId) {
+        this.isSpeaking = false;
+      }
+    }
+  }
+
+  async sendAudioChunks(buffer, utteranceId, chunkSize = 4000) {
+    for (let offset = 0; offset < buffer.length; offset += chunkSize) {
+      if (!this.active || utteranceId !== this.currentUtteranceId) break;
+      
+      const chunk = buffer.slice(offset, offset + chunkSize);
+      this.connection.sendUTF(JSON.stringify({
+        event: "media",
+        streamSid: this.streamSid,
+        media: { payload: chunk.toString("base64") }
+      }));
+      
+      await this.sleep(50); // Pause pour permettre l'interruption
     }
   }
 
@@ -253,30 +284,30 @@ class MediaStream {
     });
   }
 
-  sendAudioChunks(buffer, chunkSize = 4000) {
-    for (let offset = 0; offset < buffer.length; offset += chunkSize) {
-      const chunk = buffer.slice(offset, offset + chunkSize);
-      this.connection.sendUTF(JSON.stringify({
-        event: "media",
-        streamSid: this.streamSid,
-        media: { payload: chunk.toString("base64") }
-      }));
-    }
-  }
-
   setupDeepgram() {
     this.deepgram = deepgramClient.listen.live({
       model: "nova-2",
       language: "fr-FR",
-      endpointing: 300,
-      interim_results: false,
+      endpointing: 200,
+      utterance_end_ms: 500,
+      interim_results: true,
+      vad_events: true,
       encoding: "mulaw",
       sample_rate: 8000
     });
 
     this.deepgram.addListener(LiveTranscriptionEvents.Transcript, (data) => {
-      if (data.speech_final && data.is_final) {
+      if (data.is_final) {
         const transcript = data.channel.alternatives[0].transcript;
+        
+        // Interruption prioritaire
+        if (this.isSpeaking && Date.now() - this.lastInterruption > 500) {
+          console.log("Interruption utilisateur détectée");
+          this.currentUtteranceId++;
+          this.isSpeaking = false;
+          this.lastInterruption = Date.now();
+        }
+        
         this.handleUserInput(transcript);
       }
     });
@@ -310,7 +341,7 @@ class MediaStream {
       await this.sleep(300 + Math.random() * 400);
 
       for await (const chunk of stream) {
-        if (!this.active) break;
+        if (!this.active || !this.isSpeaking) break;
         
         const content = chunk.choices[0]?.delta?.content || "";
         fullResponse += content;
