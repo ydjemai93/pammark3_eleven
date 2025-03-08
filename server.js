@@ -36,10 +36,15 @@ const ELEVENLABS_SIMILARITY = 0.85;
 // Conversation Settings
 const systemMessage = "Tu es un agent de call center empathique, patient et professionnel. Ta mission est d’aider les clients de manière concise et chaleureuse, en proposant des solutions adaptées à leurs besoins.";
 const initialAssistantMessage = "Bonjour ! Je suis Pam, ton agent téléphonique IA. Merci d’avoir rempli le formulaire...";
-const BACKCHANNELS = ["D'accord", "Je vois", "Très bien", "Hmm"];
+
 const CONVERSATION_HISTORY_LIMIT = 6;
+const BACKCHANNELS = ["D'accord", "Je vois", "Très bien", "Hmm"];
 
 const PORT = process.env.PORT || 8080;
+
+// Flags globaux pour gérer le TTS
+let speaking = false;
+let ttsAbort = false;
 
 //------------------------------------------
 // Serveur HTTP
@@ -47,7 +52,6 @@ const PORT = process.env.PORT || 8080;
 const server = http.createServer(async (req, res) => {
   const parsedUrl = url.parse(req.url, true);
   const pathname = parsedUrl.pathname;
-
   console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
 
   if (req.method === "GET" && pathname === "/") {
@@ -67,7 +71,7 @@ const server = http.createServer(async (req, res) => {
       let serverUrl = process.env.SERVER || "localhost";
       serverUrl = serverUrl.replace(/^https?:\/\//, "");
       streamsXML = streamsXML.replace("<YOUR NGROK URL>", serverUrl);
-
+      console.log("streams.xml généré :", streamsXML);
       res.writeHead(200, { "Content-Type": "text/xml" });
       return res.end(streamsXML);
     } catch (err) {
@@ -80,23 +84,19 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "POST" && pathname === "/outbound") {
     let body = "";
     req.on("data", (chunk) => (body += chunk));
-    
     req.on("end", async () => {
       try {
         const parsed = JSON.parse(body);
         if (!parsed.to) throw new Error("'to' missing");
         if (!twilioClient) throw new Error("Twilio not configured");
 
-        // Correction de l'URL
         let domain = process.env.SERVER || "";
         if (!domain.match(/^https?:\/\//)) {
           domain = `https://${domain.replace(/^\/|\/$/g, "")}`;
         }
         const twimlUrl = `${domain}/twiml`;
-
         const fromNumber = process.env.TWILIO_PHONE_NUMBER || "+15017122661";
         console.log("Calling to:", parsed.to, "Twiml URL:", twimlUrl);
-
         const call = await twilioClient.calls.create({
           to: parsed.to,
           from: fromNumber,
@@ -104,16 +104,14 @@ const server = http.createServer(async (req, res) => {
           method: "POST",
           timeout: 15
         });
-
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ success: true, callSid: call.sid }));
+        return res.end(JSON.stringify({ success: true, callSid: call.sid }));
       } catch (err) {
         console.error("Outbound error:", err);
         res.writeHead(err.status || 500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: err.message }));
+        return res.end(JSON.stringify({ error: err.message }));
       }
     });
-    
     return;
   }
 
@@ -130,7 +128,7 @@ const wsServer = new WebSocketServer({
 });
 
 wsServer.on("request", (request) => {
-  if (request.resourceURL.pathname === "/streams") {
+  if (request.resourceURL.pathname.startsWith("/streams")) {
     const connection = request.accept(null, request.origin);
     new MediaStream(connection);
   } else {
@@ -146,11 +144,11 @@ class MediaStream {
     this.connection = connection;
     this.streamSid = "";
     this.active = true;
+    // Conversation initiale avec le message système et le message initial
     this.conversation = [
       { role: "system", content: systemMessage },
       { role: "assistant", content: initialAssistantMessage }
     ];
-    
     this.setupDeepgram();
     this.setupEventHandlers();
   }
@@ -181,6 +179,8 @@ class MediaStream {
       case "start":
         this.startConversation();
         break;
+      default:
+        break;
     }
   }
 
@@ -199,10 +199,14 @@ class MediaStream {
 
   async speak(text) {
     if (!this.active) return;
-
     try {
       const audioBuffer = await this.synthesizeSpeech(text);
+      if (ttsAbort) {
+        console.log("speak => TTS abort triggered, skipping audio send");
+        return;
+      }
       const mulawBuffer = await this.convertAudio(audioBuffer);
+      if (ttsAbort) return;
       this.sendAudioChunks(mulawBuffer);
     } catch (err) {
       console.error("TTS error:", err);
@@ -284,14 +288,19 @@ class MediaStream {
 
   async handleUserInput(transcript) {
     if (!this.active) return;
-
+    // *** Interrompre toute réponse en cours avant de traiter le nouvel input ***
+    ttsAbort = true;
+    await this.sleep(200); // laisser le temps à l'ancienne réponse de s'arrêter
     this.conversation.push({ role: "user", content: transcript });
     this.conversation = this.conversation.slice(-CONVERSATION_HISTORY_LIMIT);
-    
+    ttsAbort = false; // réinitialiser pour la nouvelle réponse
     await this.generateResponse();
   }
 
   async generateResponse() {
+    if (!this.active) return;
+    speaking = true;
+    ttsAbort = false;
     try {
       const stream = openai.beta.chat.completions.stream({
         model: "gpt-4o",
@@ -307,34 +316,34 @@ class MediaStream {
       let fullResponse = "";
       let partialBuffer = "";
 
+      // Petite pause pour réduire la latence initiale
       await this.sleep(300 + Math.random() * 400);
 
       for await (const chunk of stream) {
-        if (!this.active) break;
-        
+        if (!this.active || ttsAbort) break;
         const content = chunk.choices[0]?.delta?.content || "";
         fullResponse += content;
         partialBuffer += content;
-
+        // Dès qu'une phrase se termine et que le bloc est suffisamment long (~60 caractères)
         if (/[.!?]/.test(partialBuffer) && partialBuffer.length > 60) {
           const toSpeak = partialBuffer.trim();
           partialBuffer = "";
           await this.speakWithDelay(toSpeak, 150);
-          if (!this.active) break;
+          if (ttsAbort) break;
         }
       }
-
-      if (this.active && partialBuffer.trim()) {
-        if (partialBuffer.length < 40 && Math.random() > 0.5) {
-          partialBuffer = this.randomBackchannel();
-        }
+      // Si un reste de texte subsiste, on le parle
+      if (this.active && partialBuffer.trim() && !ttsAbort) {
         await this.speak(partialBuffer.trim());
+      }
+      if (fullResponse.trim() && !ttsAbort) {
         this.conversation.push({ role: "assistant", content: fullResponse });
       }
     } catch (err) {
       console.error("GPT error:", err);
       await this.speak("Je rencontre une difficulté technique, veuillez réessayer.");
     }
+    speaking = false;
   }
 
   async speakWithDelay(text, delay = 300) {
@@ -344,10 +353,6 @@ class MediaStream {
 
   sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
-  }
-
-  randomBackchannel() {
-    return BACKCHANNELS[Math.floor(Math.random() * BACKCHANNELS.length)];
   }
 }
 
