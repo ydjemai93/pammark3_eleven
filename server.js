@@ -34,8 +34,8 @@ const ELEVENLABS_STABILITY = 0.35;
 const ELEVENLABS_SIMILARITY = 0.85;
 
 // Conversation Settings
-const systemMessage = "Tu es un agent de call center empathique, patient et professionnel. Ta mission est d’aider les clients de manière concise et chaleureuse, en proposant des solutions adaptées à leurs besoins.";
-const initialAssistantMessage = "Bonjour ! Je suis Pam, ton agent téléphonique IA. Merci d’avoir rempli le formulaire...";
+const systemMessage = "Tu es Pam, un agent de call center intelligent et accessible, doté d’une large palette de compétences : gestion des appels, support client, assistance technique et aide à la vente. Ta manière de communiquer doit rester conviviale et naturelle. Plutôt que de lister tes capacités, tu les utilises au fil de la conversation pour répondre aux besoins du client de façon fluide et humaine.";
+const initialAssistantMessage = " Bonjour, ici Pam. Merci d’avoir pris contact. Comment puis-je vous aider aujourd’hui ?";
 
 const CONVERSATION_HISTORY_LIMIT = 6;
 const BACKCHANNELS = ["D'accord", "Je vois", "Très bien", "Hmm"];
