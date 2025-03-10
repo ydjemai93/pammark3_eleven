@@ -144,13 +144,13 @@ class MediaStream {
     this.connection = connection;
     this.streamSid = "";
     this.active = true;
-    // Historique de la conversation avec message système et message initial
+    // Historique de conversation initiale
     this.conversation = [
       { role: "system", content: systemMessage },
       { role: "assistant", content: initialAssistantMessage }
     ];
     console.log(`[${new Date().toISOString()}] Conversation initiale:`, JSON.stringify(this.conversation, null, 2));
-    this.inputDebounceTimer = null; // Variable de debounce pour regrouper les inputs
+    this.inputDebounceTimer = null; // Pour regrouper les inputs utilisateur
     this.setupDeepgram();
     this.setupEventHandlers();
   }
@@ -292,23 +292,28 @@ class MediaStream {
 
   async handleUserInput(transcript) {
     if (!this.active) return;
+    // Filtrer les messages vides ou trop courts (moins de 2 caractères après trim)
+    if (transcript.trim().length < 2) {
+      console.log(`[${new Date().toISOString()}] Ignoring empty or too short transcript`);
+      return;
+    }
     console.log(`[${new Date().toISOString()}] User input received: "${transcript}"`);
     
-    // On interrompt la réponse en cours
+    // Interrompre toute réponse en cours
     ttsAbort = true;
     await this.sleep(200);
     
-    // Ajoute le message utilisateur à l'historique
+    // Ajouter le message utilisateur à l'historique
     this.conversation.push({ role: "user", content: transcript });
     console.log(`[${new Date().toISOString()}] Updated conversation history (avant debounce):`, JSON.stringify(this.conversation, null, 2));
     this.conversation = this.conversation.slice(-CONVERSATION_HISTORY_LIMIT);
     
-    // Appliquer un debounce de 500ms avant de générer la réponse
+    // Appliquer un debounce de 800ms avant de générer la réponse
     if (this.inputDebounceTimer) clearTimeout(this.inputDebounceTimer);
     this.inputDebounceTimer = setTimeout(async () => {
-      ttsAbort = false; // réinitialiser pour la nouvelle réponse
+      ttsAbort = false;
       await this.generateResponse();
-    }, 500);
+    }, 800);
   }
 
   async generateResponse() {
@@ -338,7 +343,6 @@ class MediaStream {
         const content = chunk.choices[0]?.delta?.content || "";
         fullResponse += content;
         partialBuffer += content;
-        // Dès qu'une phrase se termine et que le bloc est suffisamment long (~60 caractères)
         if (/[.!?]/.test(partialBuffer) && partialBuffer.length > 60) {
           const toSpeak = partialBuffer.trim();
           partialBuffer = "";
