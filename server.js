@@ -14,7 +14,7 @@ let twilioClient = null;
 if (accountSid && authToken) {
   const twilio = require("twilio");
   twilioClient = twilio(accountSid, authToken);
-  console.log("Twilio client OK:", accountSid);
+  console.log(`[${new Date().toISOString()}] Twilio client OK: ${accountSid}`);
 } else {
   console.warn("Twilio credentials missing => no outbound calls");
 }
@@ -33,9 +33,9 @@ const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "WQKwBV2Uzw1gSGr6
 const ELEVENLABS_STABILITY = 0.35;
 const ELEVENLABS_SIMILARITY = 0.85;
 
-// Conversation Settings
+// Conversation Settings & Prompts
 const systemMessage = "Tu es Pam, un agent de call center intelligent et accessible, doté d’une large palette de compétences : gestion des appels, support client, assistance technique et aide à la vente. Ta manière de communiquer doit rester conviviale et naturelle. Plutôt que de lister tes capacités, tu les utilises au fil de la conversation pour répondre aux besoins du client de façon fluide et humaine.";
-const initialAssistantMessage = " Bonjour, ici Pam. Merci d’avoir pris contact. Comment puis-je vous aider aujourd’hui ?";
+const initialAssistantMessage = "Bonjour, ici Pam. Merci d’avoir pris contact. Comment puis-je vous aider aujourd’hui ?";
 
 const CONVERSATION_HISTORY_LIMIT = 6;
 const BACKCHANNELS = ["D'accord", "Je vois", "Très bien", "Hmm"];
@@ -71,7 +71,7 @@ const server = http.createServer(async (req, res) => {
       let serverUrl = process.env.SERVER || "localhost";
       serverUrl = serverUrl.replace(/^https?:\/\//, "");
       streamsXML = streamsXML.replace("<YOUR NGROK URL>", serverUrl);
-      console.log("streams.xml généré :", streamsXML);
+      console.log(`[${new Date().toISOString()}] streams.xml généré : ${streamsXML}`);
       res.writeHead(200, { "Content-Type": "text/xml" });
       return res.end(streamsXML);
     } catch (err) {
@@ -96,7 +96,7 @@ const server = http.createServer(async (req, res) => {
         }
         const twimlUrl = `${domain}/twiml`;
         const fromNumber = process.env.TWILIO_PHONE_NUMBER || "+15017122661";
-        console.log("Calling to:", parsed.to, "Twiml URL:", twimlUrl);
+        console.log(`[${new Date().toISOString()}] Calling to: ${parsed.to} Twiml URL: ${twimlUrl}`);
         const call = await twilioClient.calls.create({
           to: parsed.to,
           from: fromNumber,
@@ -144,11 +144,12 @@ class MediaStream {
     this.connection = connection;
     this.streamSid = "";
     this.active = true;
-    // Conversation initiale avec le message système et le message initial
+    // Historique de la conversation
     this.conversation = [
       { role: "system", content: systemMessage },
       { role: "assistant", content: initialAssistantMessage }
     ];
+    console.log(`[${new Date().toISOString()}] Conversation initiale:`, JSON.stringify(this.conversation, null, 2));
     this.setupDeepgram();
     this.setupEventHandlers();
   }
@@ -164,7 +165,7 @@ class MediaStream {
     this.connection.on("close", () => {
       this.active = false;
       this.deepgram.finish();
-      console.log("Connection closed");
+      console.log(`[${new Date().toISOString()}] Connection closed`);
     });
   }
 
@@ -193,7 +194,7 @@ class MediaStream {
       const rawAudio = Buffer.from(payload, "base64");
       this.deepgram.send(rawAudio);
     } catch (err) {
-      console.error("Audio processing error:", err);
+      console.error(`[${new Date().toISOString()}] Audio processing error:`, err);
     }
   }
 
@@ -202,14 +203,15 @@ class MediaStream {
     try {
       const audioBuffer = await this.synthesizeSpeech(text);
       if (ttsAbort) {
-        console.log("speak => TTS abort triggered, skipping audio send");
+        console.log(`[${new Date().toISOString()}] speak => TTS abort triggered, skipping audio send`);
         return;
       }
       const mulawBuffer = await this.convertAudio(audioBuffer);
       if (ttsAbort) return;
       this.sendAudioChunks(mulawBuffer);
+      console.log(`[${new Date().toISOString()}] Spoken: "${text}"`);
     } catch (err) {
-      console.error("TTS error:", err);
+      console.error(`[${new Date().toISOString()}] TTS error:`, err);
     }
   }
 
@@ -281,6 +283,7 @@ class MediaStream {
     this.deepgram.addListener(LiveTranscriptionEvents.Transcript, (data) => {
       if (data.speech_final && data.is_final) {
         const transcript = data.channel.alternatives[0].transcript;
+        console.log(`[${new Date().toISOString()}] Deepgram Transcript: "${transcript}"`);
         this.handleUserInput(transcript);
       }
     });
@@ -288,12 +291,14 @@ class MediaStream {
 
   async handleUserInput(transcript) {
     if (!this.active) return;
-    // *** Interrompre toute réponse en cours avant de traiter le nouvel input ***
+    console.log(`[${new Date().toISOString()}] User input received: "${transcript}"`);
+    // Interrompre toute réponse en cours avant de traiter le nouvel input
     ttsAbort = true;
-    await this.sleep(200); // laisser le temps à l'ancienne réponse de s'arrêter
+    await this.sleep(200);
     this.conversation.push({ role: "user", content: transcript });
+    console.log(`[${new Date().toISOString()}] Updated conversation history:`, JSON.stringify(this.conversation, null, 2));
     this.conversation = this.conversation.slice(-CONVERSATION_HISTORY_LIMIT);
-    ttsAbort = false; // réinitialiser pour la nouvelle réponse
+    ttsAbort = false;
     await this.generateResponse();
   }
 
@@ -332,15 +337,16 @@ class MediaStream {
           if (ttsAbort) break;
         }
       }
-      // Si un reste de texte subsiste, on le parle
       if (this.active && partialBuffer.trim() && !ttsAbort) {
         await this.speak(partialBuffer.trim());
       }
       if (fullResponse.trim() && !ttsAbort) {
+        console.log(`[${new Date().toISOString()}] Assistant response generated: "${fullResponse.trim()}"`);
         this.conversation.push({ role: "assistant", content: fullResponse });
+        console.log(`[${new Date().toISOString()}] Updated conversation history:`, JSON.stringify(this.conversation, null, 2));
       }
     } catch (err) {
-      console.error("GPT error:", err);
+      console.error(`[${new Date().toISOString()}] GPT error:`, err);
       await this.speak("Je rencontre une difficulté technique, veuillez réessayer.");
     }
     speaking = false;
