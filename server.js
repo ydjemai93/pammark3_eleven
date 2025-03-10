@@ -144,12 +144,13 @@ class MediaStream {
     this.connection = connection;
     this.streamSid = "";
     this.active = true;
-    // Historique de la conversation
+    // Historique de la conversation avec message système et message initial
     this.conversation = [
       { role: "system", content: systemMessage },
       { role: "assistant", content: initialAssistantMessage }
     ];
     console.log(`[${new Date().toISOString()}] Conversation initiale:`, JSON.stringify(this.conversation, null, 2));
+    this.inputDebounceTimer = null; // Variable de debounce pour regrouper les inputs
     this.setupDeepgram();
     this.setupEventHandlers();
   }
@@ -292,14 +293,22 @@ class MediaStream {
   async handleUserInput(transcript) {
     if (!this.active) return;
     console.log(`[${new Date().toISOString()}] User input received: "${transcript}"`);
-    // Interrompre toute réponse en cours avant de traiter le nouvel input
+    
+    // On interrompt la réponse en cours
     ttsAbort = true;
     await this.sleep(200);
+    
+    // Ajoute le message utilisateur à l'historique
     this.conversation.push({ role: "user", content: transcript });
-    console.log(`[${new Date().toISOString()}] Updated conversation history:`, JSON.stringify(this.conversation, null, 2));
+    console.log(`[${new Date().toISOString()}] Updated conversation history (avant debounce):`, JSON.stringify(this.conversation, null, 2));
     this.conversation = this.conversation.slice(-CONVERSATION_HISTORY_LIMIT);
-    ttsAbort = false;
-    await this.generateResponse();
+    
+    // Appliquer un debounce de 500ms avant de générer la réponse
+    if (this.inputDebounceTimer) clearTimeout(this.inputDebounceTimer);
+    this.inputDebounceTimer = setTimeout(async () => {
+      ttsAbort = false; // réinitialiser pour la nouvelle réponse
+      await this.generateResponse();
+    }, 500);
   }
 
   async generateResponse() {
